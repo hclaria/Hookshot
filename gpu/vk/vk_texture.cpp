@@ -22,6 +22,7 @@
 #include <atomic>
 #include <new>
 #include <chrono>
+#include <condition_variable>
 #include <cmath>
 #include <cstring>
 #include <exception>
@@ -149,8 +150,8 @@ VkFormat image_format_of(VkFormat vf, bool astc_decoded) {
     return is_depth_format(vf) ? vf : astc_decoded ? VK_FORMAT_R8G8B8A8_UNORM : linear_twin(vf);
 }
 /// (hookshot) The format a view of an image takes for a use: the view's NVN format as this device has it (widened), the image's own
-/// for depth and for a format Vulkan lacks, decoded ASTC as RGBA8, ASTC kept as BC3 as BC3 (sampled only); UNDEFINED: no such view
-/// (a compressed format is no target). texture_view's choice, and the pipeline state list's: one rule for both
+/// for depth and for a format Vulkan lacks, decoded ASTC as RGBA8, BC targets as their raw block-texel format, ASTC kept as BC3
+/// as BC3 (sampled only); UNDEFINED: no such view (ASTC is no target). texture_view's choice, and the pipeline state list's: one rule for both
 VkFormat view_format_of(VkFormat image, bool astc_decoded, bool bc, int view_nvn, ViewUse use, VkFormat force_format) {
     int from = 0;
     VkFormat f = widened(vk_format(view_nvn).format, &from);
@@ -167,7 +168,8 @@ VkFormat view_format_of(VkFormat image, bool astc_decoded, bool bc, int view_nvn
             f = srgb ? VK_FORMAT_BC3_SRGB_BLOCK : VK_FORMAT_BC3_UNORM_BLOCK;
     }
     if (use == ViewUse::Storage) f = force_format != VK_FORMAT_UNDEFINED ? force_format : storage_view_format(f);
-    if (use == ViewUse::Attachment && (is_astc(f) || is_bc(f))) return VK_FORMAT_UNDEFINED;
+    if (use == ViewUse::Attachment && is_bc(f)) f = storage_view_format(f);
+    if (use == ViewUse::Attachment && is_astc(f)) return VK_FORMAT_UNDEFINED;
     return f;
 }
 /// (hookshot) The format a draw renders in, on this device, into a texture of NVN format tex_nvn through a view of NVN format view_nvn
@@ -493,6 +495,112 @@ struct Staging {
     uint8_t* data = nullptr;
     VmaAllocation allocation = nullptr;
 };
+/// The staging arenas kept when idle (texture_frame): 64 MB on a card of 6.5 GB or less, 256 MB above.
+/// RX_VK_STAGING_KEEP_MB=<n>: that many
+uint64_t staging_keep() {
+    static const uint64_t keep = []() -> uint64_t {
+        if (const char* e = getenv("RX_VK_STAGING_KEEP_MB")) return (uint64_t)atoi(e) << 20;
+        uint64_t used = 0, allowed = 0;
+        return (vram_usage(&used, &allowed) && allowed <= (6ull << 30) + (512ull << 20) ? 64ull : 256ull) << 20;
+    }();
+    return keep;
+}
+
+/// An arena of size bytes, made and mapped (false: none could be)
+bool arena_make(Arena& a, uint64_t size) {
+    void* m = nullptr;
+    a.size = size;
+    if (!create_buffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true, a.buffer, a.allocation,
+                       &m))
+        return false;
+    if (!m) {
+        destroy_buffer(a.buffer, a.allocation);   // (made but not mapped: of no use here)
+        a.buffer = VK_NULL_HANDLE, a.allocation = nullptr;
+        return false;
+    }
+    a.mapped = (uint8_t*)m;
+    return true;
+}
+
+// ---- (hookshot, smoothness) a spare staging arena, made and freed off the replay thread ----
+// Making a 64 MB arena is a memory allocation and a map: 6-66 ms of the replay thread on an RTX 3060 (Linux, NVIDIA 615.71), up to
+// ~360 ms there with VRAM nearly full, and the frame waits for it. The 30 s idle rule and the 256 MB cap below free arenas that the
+// next streamed texture then makes again in the middle of play (the "a staging arena of 64 MB took" lines, and the "a frame's uploads
+// took" ones they fall in: Kakariko Village, 2026-11-12). On a card that keeps 256 MB of arenas, one 64 MB arena more is held ready:
+// staging() takes it at once and a worker makes the next, and an idle arena that would be freed becomes the spare instead (the worker
+// frees the others). A card that keeps 64 MB (6.5 GB or less) is as before: its VRAM is what the idle rule gives back.
+// RX_VK_STAGING_SPARE=0: off, as before; 1: on whatever the card
+struct SpareArenas {
+    std::mutex mu;
+    std::condition_variable cv;
+    Arena spare;
+    bool have = false, want = false, started = false;
+    std::vector<Arena> to_free;
+    std::atomic<int64_t> taken{0}, made_here{0};
+};
+SpareArenas spare_arenas;
+bool spare_on() {
+    static const bool on = [] {
+        const char* e = getenv("RX_VK_STAGING_SPARE");
+        if (e && *e) return !env_value_off(e);
+        return staging_keep() > kArena;
+    }();
+    return on;
+}
+void spare_worker() {
+    SpareArenas& s = spare_arenas;
+    std::unique_lock lk(s.mu);
+    for (;;) {
+        s.cv.wait(lk, [&] { return (s.want && !s.have) || !s.to_free.empty(); });
+        std::vector<Arena> gone;
+        gone.swap(s.to_free);
+        const bool make = s.want && !s.have;
+        s.want = false;
+        lk.unlock();
+        for (Arena& a : gone) destroy_buffer(a.buffer, a.allocation);
+        Arena a;
+        const bool ok = make && arena_make(a, kArena);
+        lk.lock();
+        if (ok) {
+            if (!s.have) s.spare = a, s.have = true;
+            else s.to_free.push_back(a);   // (one came back as the spare meanwhile)
+        }
+    }
+}
+/// (s.mu held) the worker started, and asked for a spare when there is none
+void spare_wake(SpareArenas& s, bool want) {
+    if (!s.started) {
+        s.started = true;
+        std::thread(spare_worker).detach();   // (for the process's life: the device is never destroyed before it ends)
+    }
+    if (want && !s.have) s.want = true;
+    s.cv.notify_one();
+}
+/// The spare, if one is ready (asks the worker for the next either way)
+bool spare_take(Arena& out) {
+    if (!spare_on()) return false;
+    SpareArenas& s = spare_arenas;
+    std::lock_guard lk(s.mu);
+    const bool got = s.have;
+    if (got) out = s.spare, s.have = false, s.spare = {};
+    spare_wake(s, true);
+    return got;
+}
+/// An idle arena let go: the spare if there is none (a 64 MB one), else freed on the worker. false: spare_on() is off
+bool spare_give_back(const Arena& a) {
+    if (!spare_on()) return false;
+    SpareArenas& s = spare_arenas;
+    std::lock_guard lk(s.mu);
+    if (!s.have && a.size == kArena) {
+        s.spare = a, s.have = true;
+        s.spare.value = 0, s.spare.used = 0;
+    } else {
+        s.to_free.push_back(a);
+    }
+    spare_wake(s, false);
+    return true;
+}
+
 uint64_t completed_value = 0;
 // (GPU writes into guest memory by buffers: GPU address -> (end, the submission that wrote it last))
 std::map<uint64_t, std::pair<uint64_t, uint64_t>> gpu_wrote;
@@ -531,23 +639,24 @@ Staging staging(uint64_t n, uint64_t align = 256) {
         }
     }
     Arena a;
-    void* m = nullptr;
-    const auto make = [&](uint64_t size) {
-        a.size = size, m = nullptr;
-        if (!create_buffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true, a.buffer,
-                           a.allocation, &m))
-            return false;
-        if (m) return true;
-        destroy_buffer(a.buffer, a.allocation);   // (made but not mapped: of no use here)
-        a.buffer = VK_NULL_HANDLE, a.allocation = nullptr;
-        return false;
-    };
+    const uint64_t need = (n + 0xFFFFF) & ~0xFFFFFull;
+    if (need <= kArena && spare_take(a)) {   // (the spare, made off this thread: see SpareArenas)
+        const int64_t k = ++spare_arenas.taken;
+        if (k <= 4 || k % 100 == 0)
+            logf("vk: staging: the spare arena taken (%lld times; %lld made on this thread)", (long long)k,
+                 (long long)spare_arenas.made_here.load());
+        a.value = rec_value, a.used = n;
+        a.used_at = std::chrono::steady_clock::now();
+        arenas.push_back(a);
+        return {a.buffer, 0, a.mapped, a.allocation};
+    }
+    if (spare_on()) spare_arenas.made_here++;
+    const auto make = [&](uint64_t size) { return arena_make(a, size); };
     const auto t_make = std::chrono::steady_clock::now();
     // (hookshot) and one of the size asked for when a 64 MB one cannot be made: without resizable BAR an arena is new system
     // memory the driver must pin. On a 16 GB laptop with the game's pools imported and RAM nearly gone, no 64 MB arena could
     // be made even for a 36 KB upload, the idle ones having been given back (texture_frame), and every upload failed until one
     // was free: BC3 textures drawn as noise (RX 5500M, 2.9 GB of RAM available)
-    const uint64_t need = (n + 0xFFFFF) & ~0xFFFFFull;
     if (!make(std::max(kArena, need))) {
         const bool small = need < kArena && make(need);
         static std::atomic<int> told{0};
@@ -562,7 +671,6 @@ Staging staging(uint64_t n, uint64_t align = 256) {
         static int slow_logged;
         if (ms > 5 && slow_logged++ < 24) logf("vk: a staging arena of %llu MB took %.1f ms to make", (unsigned long long)(a.size >> 20), ms);
     }
-    a.mapped = (uint8_t*)m;
     a.value = rec_value, a.used = n;
     a.used_at = std::chrono::steady_clock::now();
     arenas.push_back(a);
@@ -2321,15 +2429,18 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
             vkGetPhysicalDeviceImageFormatProperties(dev.physical, x.format, x.type, VK_IMAGE_TILING_OPTIMAL,
                 x.usage, flags, &limits) == VK_SUCCESS)
             x.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
-        // Render to raw block views of 2D images. A 3D image's attachments use a separate uncompressed mip
+        // Render to raw block views of 2D images. A 3D image's attachments use a separate uncompressed mip.
+        // On AMD drivers (amdvlk), queries against the compressed format return VK_ERROR_FORMAT_NOT_SUPPORTED (-11),
+        // but raw block-texel views can be attached with EXTENDED_USAGE; a refused image is made again without the usage below (#1801).
+        const bool is_amd = dev.props.vendorID == 0x1002;
         if (x.type != VK_IMAGE_TYPE_3D && (format_props(raw).optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT)) {
             const VkResult r = vkGetPhysicalDeviceImageFormatProperties(dev.physical, x.format, x.type, VK_IMAGE_TILING_OPTIMAL,
                 x.usage | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, flags, &limits);
-            if (r == VK_SUCCESS) x.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+            if (r == VK_SUCCESS || is_amd) x.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
             static int told;
             if (r != VK_SUCCESS && told++ < 4)
-                logf("vk: BC image %ux%u (vk %d) as a raw colour attachment: the driver says %d", x.width, x.height,
-                     (int)x.format, (int)r);
+                logf("vk: BC image %ux%u (vk %d) as a raw colour attachment: the driver says %d%s", x.width, x.height,
+                     (int)x.format, (int)r, is_amd ? " (AMD: taken)" : "");
         }
     }
     if (x.type == VK_IMAGE_TYPE_2D && x.layers >= 6 && x.width == x.height && x.samples == VK_SAMPLE_COUNT_1_BIT)
@@ -4443,11 +4554,7 @@ void texture_frame(uint64_t completed) {
         // (hookshot: 64 on a card of 6 GB or less. On one with resizable BAR the arenas are VRAM: VMA puts a host-visible buffer the GPU
         // reads (STORAGE: the ASTC decoder) in DEVICE_LOCAL | HOST_VISIBLE. The RTX 4050 Laptop held 4 idle ones, 256 MB of 5.7 GB, through
         // all of Kokiri gameplay, which stages ~nothing. A scene change makes the ones it needs again. RX_VK_STAGING_KEEP_MB=256: as before)
-        static const uint64_t keep = []() -> uint64_t {
-            if (const char* e = getenv("RX_VK_STAGING_KEEP_MB")) return (uint64_t)atoi(e) << 20;
-            uint64_t used = 0, allowed = 0;
-            return (vram_usage(&used, &allowed) && allowed <= (6ull << 30) + (512ull << 20) ? 64ull : 256ull) << 20;
-        }();
+        const uint64_t keep = staging_keep();
         uint64_t kept = 0;
         for (auto it = arenas.begin(); it != arenas.end();) {
             const bool idle = it->value <= completed && it->value != rec_value;
@@ -4456,7 +4563,7 @@ void texture_frame(uint64_t completed) {
             static const int64_t idle_s = getenv("RX_VK_STAGING_IDLE_S") ? atoll(getenv("RX_VK_STAGING_IDLE_S")) : 30;
             const bool stale = idle_s && std::chrono::steady_clock::now() - it->used_at > std::chrono::seconds(idle_s);
             if (idle && (it->size > kArena || kept + it->size > keep || stale)) {
-                destroy_buffer(it->buffer, it->allocation);
+                if (!spare_give_back(*it)) destroy_buffer(it->buffer, it->allocation);   // (SpareArenas)
                 it = arenas.erase(it);
                 continue;
             }

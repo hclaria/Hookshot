@@ -76,6 +76,29 @@ def save(img_dir, starts):
         f.write("".join("%08x\n" % s for s in sorted(starts)))
 
 
+# (the dev-loop proposal) chunks of ~4 MB, not 24: a change to two functions compiled their two chunks again, 14 and 24 MB, ~4
+# minutes on one compiler (v2.0.12 to v2.0.13), the floor of a small update's compile. Besides the boundaries in chunks.txt a
+# chunk also starts at the first function at or after each SUB_STRIDE of guest address. The game's code does not move between
+# Hookshot versions, so these stay where they are however the C grows or shrinks; a function found where none was found before
+# moves one of them by one function, and only its two chunks change. ~14.8 bytes of C a guest byte: ~3.7 MB a chunk
+SUB_STRIDE = 0x40000
+
+
+def sub_starts(funcs, stride=SUB_STRIDE):
+    """The first function at or after each multiple of stride past the first function (none when stride is 0)"""
+    order = sorted(funcs)
+    out = set()
+    if not order or not stride:
+        return out
+    i, edge = 0, (order[0] // stride + 1) * stride
+    while True:
+        i = bisect.bisect_left(order, edge, i)
+        if i >= len(order):
+            return out
+        out.add(order[i])
+        edge = (order[i] // stride + 1) * stride
+
+
 def seed_from_gen(gen_dir):
     """The boundaries of an existing size-chunked lift: the first function defined in each code_NNN.c after the
     first"""
@@ -292,7 +315,7 @@ def write(L, gen_dir, img_dir, rechunk=False, counters=(), jobs=None, took=None)
     starts = [] if rechunk else load(img_dir)
     if not starts and not rechunk:
         starts = seed_from_gen(gen_dir)
-    b = Boundaries(a64_lift.CHUNK_BYTES, starts, L.funcs)
+    b = Boundaries(a64_lift.CHUNK_BYTES, sorted(set(starts) | sub_starts(L.funcs)), L.funcs)   # (not saved: sub_starts)
     plain = _plain(L)   # (before L.emit_function is set below)
     base_emit = L.emit_function
     jobs = emit_jobs() if jobs is None else jobs
@@ -329,6 +352,9 @@ def write(L, gen_dir, img_dir, rechunk=False, counters=(), jobs=None, took=None)
         if made is not None:
             made.close()   # (the processes go now, not when the generator is collected)
     took("emit and write (%d process%s)" % (procs, "" if procs == 1 else "es"))
+    # (code_NNN.c: three digits, which split_big, split_hot and build.py match. A thousandth chunk would be left out of all three)
+    if any(re.fullmatch(r"code_\d{4,}\.c", os.path.basename(f)) for f in files):
+        raise SystemExit("chunks: more than 1000 chunks (SUB_STRIDE %#x): make it larger" % SUB_STRIDE)
     # (the numbered chunks only: files has code_hot.c too, and counting it skipped the first stale chunk, linked twice)
     n = sum(1 for f in files if re.fullmatch(r"code_\d{3}\.c", os.path.basename(f)))
     while os.path.exists(os.path.join(gen_dir, "code_%03d.c" % n)):   # (fewer chunks than the last lift)
